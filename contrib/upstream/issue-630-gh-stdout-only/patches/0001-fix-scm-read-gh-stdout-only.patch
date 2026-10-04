@@ -1,0 +1,400 @@
+From f5b986521c6e53a4dee893b09268357f431e0fe8 Mon Sep 17 00:00:00 2001
+From: no-mistakes contributor <noreply@example.invalid>
+Date: Thu, 1 Oct 2026 05:08:31 +0000
+Subject: [PATCH] fix(scm): read gh stdout alone so wrapper notices stop
+ corrupting payloads
+
+Every data-bearing gh invocation in the GitHub provider read
+CombinedOutput() and then treated the bytes as data, so a wrapper around
+gh that prints an audit notice to stderr and exits 0 - an approval gate,
+an SSO helper, a corporate proxy - corrupted every payload it touched:
+
+- FindPR could not parse `gh pr list --json` (a branch's existing PR
+  stops being found)
+- CreatePR put the notice inside pr.URL, so every later `gh pr view <url>`
+  targeted a URL that never existed
+- the CI step's `gh pr checks` poll failed to parse on every iteration,
+  so the loop could never converge on what CI actually reported
+- the head-commit rollup, the Actions run list, the review-comment
+  GraphQL query and the attachment repository lookup failed the same way
+
+ghOutput returns stdout alone and keeps stderr for diagnostics, which is
+what a failure quotes - including gh's own "no checks reported", which gh
+writes to stderr with a non-zero exit. UpdatePR, SetPRBaseBranch and
+RerunCheck keep CombinedOutput: they only ever use the bytes to build an
+error message.
+
+Reported in #630.
+---
+ internal/scm/github/attachments.go      |   4 +-
+ internal/scm/github/attachments_test.go |  21 +++
+ internal/scm/github/github.go           |  57 ++++++--
+ internal/scm/github/github_test.go      | 165 ++++++++++++++++++++++++
+ 4 files changed, 232 insertions(+), 15 deletions(-)
+
+diff --git a/internal/scm/github/attachments.go b/internal/scm/github/attachments.go
+index 27939a4..8e7d832 100644
+--- a/internal/scm/github/attachments.go
++++ b/internal/scm/github/attachments.go
+@@ -397,9 +397,9 @@ func (h *Host) userAssetRepo(ctx context.Context) (int64, string, error) {
+ 	}
+ 	args = append(args, "graphql", "-f", "query="+userAssetRepoQuery,
+ 		"-F", "owner="+parts[0], "-F", "name="+parts[1])
+-	out, err := h.cmd(ctx, "gh", args...).CombinedOutput()
++	out, detail, err := ghOutput(h.cmd(ctx, "gh", args...))
+ 	if err != nil {
+-		return 0, "", fmt.Errorf("gh api repository for user-attachments: %s: %w", strings.TrimSpace(string(out)), err)
++		return 0, "", fmt.Errorf("gh api repository for user-attachments: %s: %w", detail, err)
+ 	}
+ 	var response struct {
+ 		Data struct {
+diff --git a/internal/scm/github/attachments_test.go b/internal/scm/github/attachments_test.go
+index dd7be8e..4d89c09 100644
+--- a/internal/scm/github/attachments_test.go
++++ b/internal/scm/github/attachments_test.go
+@@ -244,6 +244,27 @@ func TestUserAssetClientUploadFileRejectsUnexpectedURL(t *testing.T) {
+ 	}
+ }
+ 
++// The repository lookup behind an attachment upload is a data-bearing gh read
++// like every other one, so a wrapper's stderr notice must not turn a WRITE
++// permission lookup into a parse failure. See #630.
++func TestUserAssetRepoIgnoresWrapperStderrNotice(t *testing.T) {
++	t.Parallel()
++	host := New(githubTestCmdFactory(map[string]githubTestResponse{
++		"gh api --hostname github.com graphql -f query=" + userAssetRepoQuery + " -F owner=test -F name=repo": {
++			stderr: "automic vault: human approval required\n",
++			stdout: `{"data":{"repository":{"databaseId":42,"viewerPermission":"WRITE"}}}`,
++		},
++	}), nil, "github.com", "test/repo")
++
++	id, permission, err := host.userAssetRepo(context.Background())
++	if err != nil {
++		t.Fatalf("userAssetRepo() error = %v", err)
++	}
++	if id != 42 || permission != "WRITE" {
++		t.Fatalf("userAssetRepo() = (%d, %q), want (42, WRITE)", id, permission)
++	}
++}
++
+ func TestHostUploadUserAssetSkipsGHES(t *testing.T) {
+ 	t.Parallel()
+ 	host := New(func(ctx context.Context, name string, args ...string) *exec.Cmd {
+diff --git a/internal/scm/github/github.go b/internal/scm/github/github.go
+index e269131..5776218 100644
+--- a/internal/scm/github/github.go
++++ b/internal/scm/github/github.go
+@@ -196,6 +196,37 @@ func isMissingExecutable(err error) bool {
+ 	return false
+ }
+ 
++// ghOutput runs a gh invocation and returns its stdout ALONE, plus a
++// human-readable detail string for error messages.
++//
++// Every data-bearing gh call in this provider parses stdout (or takes the
++// created PR URL from it), but gh is not necessarily the process that runs: a
++// wrapper around it - an approval gate, an SSO helper, a corporate proxy - may
++// print its own notice to stderr and still exit 0, because the notice is not a
++// refusal. Reading CombinedOutput merged that notice into the payload, so the
++// listing and rollup JSON failed to parse on bytes gh never wrote, `gh pr
++// create`'s URL carried the notice, and the CI step's poll loop could not parse
++// a single response no matter what CI reported.
++//
++// Stderr stays diagnostics, and it is what a failure quotes - including gh's own
++// "no checks reported", which gh writes to stderr with a non-zero exit.
++// Invocations that only ever use the bytes to build an error message
++// (UpdatePR, SetPRBaseBranch, RerunCheck) keep CombinedOutput: merging is
++// correct when the bytes are never parsed. See #630.
++func ghOutput(cmd *exec.Cmd) ([]byte, string, error) {
++	out, err := cmd.Output()
++	detail := strings.TrimSpace(string(out))
++	var exitErr *exec.ExitError
++	if errors.As(err, &exitErr) {
++		// ExitError.Stderr is only populated when the caller left cmd.Stderr
++		// nil, which every data-bearing gh call here does.
++		if stderr := strings.TrimSpace(string(exitErr.Stderr)); stderr != "" {
++			detail = stderr
++		}
++	}
++	return out, detail, err
++}
++
+ func parsePullRequestURL(raw, expectedHost, expectedRepo string) (int, error) {
+ 	trimmed := strings.TrimSpace(raw)
+ 	parsed, err := url.Parse(trimmed)
+@@ -248,9 +279,9 @@ func (h *Host) FindPR(ctx context.Context, branch, base string) (*scm.PR, error)
+ 	}
+ 	args = append(args, "--state", "open", "--json", jsonFields)
+ 	cmd := h.cmd(ctx, "gh", args...)
+-	out, err := cmd.CombinedOutput()
++	out, detail, err := ghOutput(cmd)
+ 	if err != nil {
+-		return nil, fmt.Errorf("gh pr list: %s: %w", strings.TrimSpace(string(out)), err)
++		return nil, fmt.Errorf("gh pr list: %s: %w", detail, err)
+ 	}
+ 	var prs []struct {
+ 		Number              int    `json:"number"`
+@@ -336,9 +367,9 @@ func (h *Host) CreatePR(ctx context.Context, branch, base string, content scm.PR
+ 	args = append(args, "--title", content.Title, "--body-file", "-")
+ 	cmd := h.cmd(ctx, "gh", args...)
+ 	cmd.Stdin = strings.NewReader(content.Body)
+-	out, err := cmd.CombinedOutput()
++	out, detail, err := ghOutput(cmd)
+ 	if err != nil {
+-		return nil, fmt.Errorf("gh pr create: %s: %w", strings.TrimSpace(string(out)), err)
++		return nil, fmt.Errorf("gh pr create: %s: %w", detail, err)
+ 	}
+ 	url := strings.TrimSpace(string(out))
+ 	pr := &scm.PR{URL: url}
+@@ -479,12 +510,12 @@ func (h *Host) getPRChecks(ctx context.Context, selector string) ([]scm.Check, e
+ 	args := append([]string{"pr", "checks", selector}, h.repoArgs()...)
+ 	args = append(args, "--json", "name,state,bucket,completedAt,link")
+ 	cmd := h.cmd(ctx, "gh", args...)
+-	out, err := cmd.CombinedOutput()
++	out, detail, err := ghOutput(cmd)
+ 	if err != nil {
+-		if strings.Contains(string(out), "no checks reported") {
++		if strings.Contains(detail, "no checks reported") {
+ 			out = []byte("[]")
+ 		} else {
+-			return nil, fmt.Errorf("gh pr checks: %s: %w", strings.TrimSpace(string(out)), err)
++			return nil, fmt.Errorf("gh pr checks: %s: %w", detail, err)
+ 		}
+ 	}
+ 	var raw []struct {
+@@ -542,9 +573,9 @@ func (h *Host) getCommitChecks(ctx context.Context, headSHA string) ([]scm.Check
+ 		if cursor != "" {
+ 			args = append(args, "-F", "cursor="+cursor)
+ 		}
+-		out, err := h.cmd(ctx, "gh", args...).CombinedOutput()
++		out, detail, err := ghOutput(h.cmd(ctx, "gh", args...))
+ 		if err != nil {
+-			return nil, fmt.Errorf("gh api checks for head commit: %s: %w", strings.TrimSpace(string(out)), err)
++			return nil, fmt.Errorf("gh api checks for head commit: %s: %w", detail, err)
+ 		}
+ 		var response struct {
+ 			Data struct {
+@@ -789,9 +820,9 @@ func (h *Host) getWorkflowRunChecks(ctx context.Context, headSHA string) ([]scm.
+ 		"-f", "per_page=100",
+ 		"--paginate", "--slurp",
+ 	)
+-	out, err := h.cmd(ctx, "gh", args...).CombinedOutput()
++	out, detail, err := ghOutput(h.cmd(ctx, "gh", args...))
+ 	if err != nil {
+-		return nil, fmt.Errorf("gh api workflow runs for head commit: %s: %w", strings.TrimSpace(string(out)), err)
++		return nil, fmt.Errorf("gh api workflow runs for head commit: %s: %w", detail, err)
+ 	}
+ 	type workflowRun struct {
+ 		ID           int64  `json:"id"`
+@@ -1456,9 +1487,9 @@ func (h *Host) GetReviewComments(ctx context.Context, pr *scm.PR) ([]scm.ReviewC
+ 		if cursor != "" {
+ 			args = append(args, "-F", "cursor="+cursor)
+ 		}
+-		out, commandErr := h.cmd(ctx, "gh", args...).CombinedOutput()
++		out, detail, commandErr := ghOutput(h.cmd(ctx, "gh", args...))
+ 		if commandErr != nil {
+-			return nil, fmt.Errorf("gh api PR review comments: %s: %w", strings.TrimSpace(string(out)), commandErr)
++			return nil, fmt.Errorf("gh api PR review comments: %s: %w", detail, commandErr)
+ 		}
+ 		var response struct {
+ 			Data struct {
+diff --git a/internal/scm/github/github_test.go b/internal/scm/github/github_test.go
+index 9e4ef4b..927deb8 100644
+--- a/internal/scm/github/github_test.go
++++ b/internal/scm/github/github_test.go
+@@ -138,6 +138,88 @@ func TestGetChecksSurfacesGHErrorStderr(t *testing.T) {
+ 	}
+ }
+ 
++// The CI step polls this on a loop, so a wrapper's stderr notice on an
++// otherwise successful `gh pr checks` used to fail every parse for the whole
++// poll window regardless of what CI actually reported. See #630.
++func TestGetChecksIgnoresWrapperStderrNotice(t *testing.T) {
++	t.Parallel()
++
++	host := New(githubTestCmdFactory(map[string]githubTestResponse{
++		"gh pr checks 123 --repo test/repo --json name,state,bucket,completedAt,link": {
++			stderr: "automic vault: human approval required\n",
++			stdout: `[{"name":"build","state":"SUCCESS","bucket":"pass"}]` + "\n",
++		},
++	}), nil, "", "test/repo")
++
++	checks, err := host.GetChecks(context.Background(), &scm.PR{Number: "123"})
++	if err != nil {
++		t.Fatalf("GetChecks() error = %v", err)
++	}
++	if len(checks) != 1 || checks[0].Name != "build" || checks[0].Bucket != scm.CheckBucketPass {
++		t.Fatalf("checks = %+v, want the single build check gh reported on stdout", checks)
++	}
++}
++
++// `gh pr checks` reports an empty rollup as a non-zero exit with the notice on
++// stderr, so that message has to stay readable now that stdout is isolated.
++// See #630.
++func TestGetChecksKeepsNoChecksReportedOnStderr(t *testing.T) {
++	t.Parallel()
++
++	host := New(githubTestCmdFactory(map[string]githubTestResponse{
++		"gh pr checks 123 --repo test/repo --json name,state,bucket,completedAt,link": {
++			stderr: "no checks reported on the 'feature' branch\n",
++			code:   1,
++		},
++	}), nil, "", "test/repo")
++
++	checks, err := host.GetChecks(context.Background(), &scm.PR{Number: "123"})
++	if err != nil {
++		t.Fatalf("GetChecks() error = %v", err)
++	}
++	if len(checks) != 0 {
++		t.Fatalf("checks = %+v, want none", checks)
++	}
++}
++
++// The head-commit path reads two more gh payloads - the GraphQL check rollup and
++// the Actions run list - so a wrapper's stderr notice must not corrupt either.
++// See #630.
++func TestGetChecksReadsCommitRollupAndRunsDespiteWrapperStderrNotice(t *testing.T) {
++	t.Parallel()
++
++	host := New(githubTestCmdFactory(map[string]githubTestResponse{
++		"gh pr view 123 --repo test/repo --json headRefOid --jq .headRefOid": {
++			stderr: "automic vault: human approval required\n",
++			stdout: "deadbeef\n",
++		},
++		githubCommitChecksCommand("", "test/repo", "deadbeef"): {
++			stderr: "automic vault: human approval required\n",
++			stdout: githubCommitChecksResponse(`[{"__typename":"CheckRun","databaseId":9,"name":"clippy","status":"COMPLETED","conclusion":"SUCCESS","completedAt":"2026-08-01T10:00:00Z","detailsUrl":"https://github.com/test/repo/actions/runs/7/job/9","checkSuite":{"app":{"slug":"github-actions"}}}]`),
++		},
++		"gh api --method GET repos/test/repo/actions/runs -f head_sha=deadbeef -f per_page=100 --paginate --slurp": {
++			stderr: "automic vault: human approval required\n",
++			stdout: `[{"total_count":1,"workflow_runs":[
++				{"id":101,"name":"ci","display_title":"","status":"completed","conclusion":"failure","updated_at":"2026-08-01T11:00:00Z"}
++			]}]` + "\n",
++		},
++	}), nil, "", "test/repo")
++
++	checks, err := host.GetChecks(context.Background(), &scm.PR{Number: "123", HeadSHA: "deadbeef"})
++	if err != nil {
++		t.Fatalf("GetChecks() error = %v", err)
++	}
++	if len(checks) != 2 {
++		t.Fatalf("GetChecks() returned %d checks, want 2: %+v", len(checks), checks)
++	}
++	if got := checks[0]; got.Name != "clippy" || got.Bucket != scm.CheckBucketPass {
++		t.Fatalf("rollup check = %+v, want clippy/pass", got)
++	}
++	if got := checks[1]; got.Name != "ci" || got.Bucket != scm.CheckBucketFail {
++		t.Fatalf("workflow run check = %+v, want ci/fail", got)
++	}
++}
++
+ func TestGetChecksIncludesFailedWorkflowRunMissingFromPRRollup(t *testing.T) {
+ 	t.Parallel()
+ 
+@@ -875,6 +957,35 @@ func TestCreatePRAddsDraftFlagWhenConfigured(t *testing.T) {
+ 	}
+ }
+ 
++// gh pr create prints the new PR URL on stdout and nothing else that matters,
++// so a wrapper's stderr notice must stay out of pr.URL: every later command
++// targets the PR by that URL, and a notice-prefixed one never existed. See #630.
++func TestCreatePRKeepsURLOutOfWrapperStderrNotice(t *testing.T) {
++	t.Parallel()
++
++	host := New(githubTestCmdFactory(map[string]githubTestResponse{
++		"gh pr create --head feature/wrapper --base main --repo test/repo --title fix: url --body-file -": {
++			stderr:    "automic vault: human approval required\n",
++			stdout:    "https://github.com/test/repo/pull/43\n",
++			wantStdin: "## What Changed\n\n- keep the URL out of wrapper noise",
++		},
++	}), nil, "", "test/repo")
++
++	pr, err := host.CreatePR(context.Background(), "feature/wrapper", "main", scm.PRContent{
++		Title: "fix: url",
++		Body:  "## What Changed\n\n- keep the URL out of wrapper noise",
++	})
++	if err != nil {
++		t.Fatalf("CreatePR() error = %v", err)
++	}
++	if pr == nil || pr.Number != "43" {
++		t.Fatalf("CreatePR() PR = %+v, want #43", pr)
++	}
++	if pr.URL != "https://github.com/test/repo/pull/43" {
++		t.Fatalf("CreatePR() URL = %q, want exactly the URL gh printed on stdout", pr.URL)
++	}
++}
++
+ func TestUpdatePRStreamsBodyThroughStdin(t *testing.T) {
+ 	t.Parallel()
+ 
+@@ -1500,6 +1611,32 @@ func TestFindPRFiltersByBaseBranch(t *testing.T) {
+ 	}
+ }
+ 
++// A gh wrapper can print an audit notice to stderr on every invocation and
++// still exit 0 (an approval gate, an SSO helper, a corporate proxy). The notice
++// is not part of the payload, so the listing JSON on stdout stays parseable and
++// the branch's existing PR is still found. See #630.
++func TestFindPRIgnoresWrapperStderrNotice(t *testing.T) {
++	t.Parallel()
++
++	host := New(githubTestCmdFactory(map[string]githubTestResponse{
++		"gh pr list --head feature/wrapper --base main --repo test/repo --state open --json number,url,baseRefName": {
++			stderr: "automic vault: human approval required\n",
++			stdout: `[{"number":42,"url":"https://github.com/test/repo/pull/42","baseRefName":"main"}]` + "\n",
++		},
++	}), nil, "", "test/repo")
++
++	pr, err := host.FindPR(context.Background(), "feature/wrapper", "main")
++	if err != nil {
++		t.Fatalf("FindPR() error = %v", err)
++	}
++	if pr == nil || pr.Number != "42" {
++		t.Fatalf("FindPR() PR = %+v, want #42", pr)
++	}
++	if pr.URL != "https://github.com/test/repo/pull/42" {
++		t.Fatalf("FindPR() URL = %q, want the URL gh printed on stdout", pr.URL)
++	}
++}
++
+ func TestFindPRForkUsesBareHeadAndFiltersOwner(t *testing.T) {
+ 	t.Parallel()
+ 
+@@ -1976,6 +2113,34 @@ func TestHost_GetReviewComments(t *testing.T) {
+ 	}
+ }
+ 
++// Review-bot comments are read from the same wrapper-wrapped gh as everything
++// else here, so the GraphQL payload has to survive a stderr notice on exit 0.
++// See #630.
++func TestGetReviewCommentsIgnoresWrapperStderrNotice(t *testing.T) {
++	t.Parallel()
++
++	page := `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[
++		{"isResolved":false,"comments":{"nodes":[{"databaseId":1,"body":"nit","path":"pkg/a.go","line":4,"url":"https://ghe.example.com/org/repo/pull/7#discussion_r1","createdAt":"2026-08-27T12:00:00Z","author":{"login":"greptile-apps[bot]"}}]}}
++	],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`
++	command := strings.Join([]string{"gh", "api", "--hostname", "ghe.example.com", "graphql",
++		"-f", "query=" + reviewThreadsQuery, "-F", "owner=org", "-F", "name=repo", "-F", "number=7"}, " ")
++
++	host := New(githubTestCmdFactory(map[string]githubTestResponse{
++		command: {
++			stderr: "automic vault: human approval required\n",
++			stdout: page,
++		},
++	}), nil, "ghe.example.com", "ghe.example.com/org/repo")
++
++	comments, err := host.GetReviewComments(context.Background(), &scm.PR{URL: "https://ghe.example.com/org/repo/pull/7"})
++	if err != nil {
++		t.Fatalf("GetReviewComments() error = %v", err)
++	}
++	if len(comments) != 1 || comments[0].ID != "1" || comments[0].Body != "nit" {
++		t.Fatalf("comments = %#v, want the single thread gh reported on stdout", comments)
++	}
++}
++
+ func TestGetPRContentRequiresExplicitStrings(t *testing.T) {
+ 	t.Parallel()
+ 	for _, payload := range []string{`{}`, `null`, `{"title":"Author"}`, `{"body":"Author text"}`, `{"title":"Author","body":null}`, `{"title":null,"body":"Author text"}`, `{"title":"Author","body":42}`, `{"title":false,"body":"text"}`, `[]`, `{"title":`} {
+-- 
+2.54.0
+
